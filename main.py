@@ -1,14 +1,18 @@
 import json
-from fastapi import FastAPI, HTTPException
+import time
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from openai import OpenAI
+from supabase import create_client, Client
 
 # 1. Configuration using Pydantic's BaseSettings
 # This automatically reads environment variables from a .env file
 class Settings(BaseSettings):
     OPENROUTER_API_KEY: str
+    SUPABASE_URL: str = "https://kyudboffpfipzxlkzxam.supabase.co"
+    SUPABASE_KEY: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt5dWRib2ZmcGZpcHp4bGt6eGFtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDkzMTk3OTgsImV4cCI6MjA2NDg5NTc5OH0.BzJlk8x56I5IPg4S78aVlhm2-bWk3UYr4yh3AuM9vXc"
 
     class Config:
         env_file = ".env"
@@ -20,6 +24,9 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=settings.OPENROUTER_API_KEY,
 )
+
+# 3. Initialize Supabase client
+supabase: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
 # 3. Initialize the FastAPI app
 app = FastAPI(
@@ -83,10 +90,12 @@ If the item is "Dynamite", your response should be:
 
 # 6. Define the API endpoint
 @app.post("/check-item", response_model=TSAResponse)
-async def check_item(request: ItemRequest):
+async def check_item(request: ItemRequest, req: Request):
     """
     Accepts an item name and returns its TSA carry-on and checked bag status.
     """
+    start_time = time.time()
+    
     try:
         completion = client.chat.completions.create(
             model="mistralai/mistral-7b-instruct", # A good, fast, and cheap model
@@ -102,6 +111,28 @@ async def check_item(request: ItemRequest):
         
         # Parse the JSON string from the AI's response
         data = json.loads(response_content)
+        
+        # Calculate response time
+        response_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Get client info
+        user_agent = req.headers.get("user-agent", "Unknown")
+        client_host = req.client.host if req.client else "Unknown"
+        
+        # Store the result in Supabase
+        try:
+            supabase.table("tsa_api_logs").insert({
+                "item_name": request.item_name,
+                "carry_on": data["carry_on"],
+                "checked_bag": data["checked_bag"],
+                "description": data["description"],
+                "response_time_ms": response_time_ms,
+                "user_agent": user_agent,
+                "ip_address": client_host
+            }).execute()
+        except Exception as db_error:
+            # Log the database error but don't fail the API request
+            print(f"Failed to log to database: {str(db_error)}")
 
         # FastAPI will automatically validate this against the TSAResponse model
         return data
